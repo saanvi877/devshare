@@ -45,7 +45,8 @@ CONFIG = {
     "inactive_timeout_minutes": 30,  # When to consider a user inactive
     "send_confirmations": True,  # Whether to send confirmation messages
     "max_screenshot_size_bytes": 1024 * 1024 * 5,  # 5MB max screenshot size
-    "memory_check_interval": 60  # Check memory usage every minute
+    "memory_check_interval": 60,  # Check memory usage every minute
+    "start_time": datetime.now().isoformat()  # Track when server started
 }
 
 # In-memory database of registered users (in production, use a real database)
@@ -98,16 +99,21 @@ def cleanup_and_monitor():
                         if len(pending_screenshots[conn_id]) > 1:
                             pending_screenshots[conn_id] = pending_screenshots[conn_id][-1:]
             
-            # Regular user cleanup
+            # Regular user cleanup - only for truly inactive users
             current_time = datetime.now()
             inactive_timeout = timedelta(minutes=CONFIG["inactive_timeout_minutes"])
             
             # Find inactive users
             inactive_users = []
             for user_id, user_data in registered_users.items():
-                last_ping = datetime.fromisoformat(user_data['last_ping'])
-                if current_time - last_ping > inactive_timeout:
-                    inactive_users.append(user_id)
+                try:
+                    last_ping = datetime.fromisoformat(user_data['last_ping'])
+                    if current_time - last_ping > inactive_timeout:
+                        inactive_users.append(user_id)
+                except (ValueError, KeyError) as e:
+                    logger.error(f"Error parsing last_ping for user {user_id}: {e}")
+                    # If we can't parse last_ping, don't remove the user
+                    continue
                     
             # Remove inactive users
             for user_id in inactive_users:
@@ -121,7 +127,7 @@ def cleanup_and_monitor():
                 # Remove user
                 del registered_users[user_id]
                 
-            # Limit max users if needed
+            # Limit max users if needed - but never remove active users
             if len(registered_users) > CONFIG["max_users"]:
                 # Sort users by last ping time, oldest first
                 sorted_users = sorted(
@@ -129,19 +135,29 @@ def cleanup_and_monitor():
                     key=lambda x: datetime.fromisoformat(x[1]['last_ping'])
                 )
                 
-                # Remove oldest users
-                users_to_remove = len(registered_users) - CONFIG["max_users"]
-                for i in range(users_to_remove):
-                    user_id, user_data = sorted_users[i]
-                    connection_id = user_data['connection_id']
-                    logger.info(f"Removing excess user {user_id}")
-                    
-                    # Clean up pending screenshots
-                    if connection_id in pending_screenshots:
-                        del pending_screenshots[connection_id]
+                # Find users that haven't been active recently but not yet inactive
+                users_to_remove = []
+                for user_id, user_data in sorted_users:
+                    if not user_data.get('active', False):
+                        users_to_remove.append(user_id)
+                        if len(registered_users) - len(users_to_remove) <= CONFIG["max_users"]:
+                            break
+                
+                # Only remove truly inactive users
+                for user_id in users_to_remove:
+                    if user_id in registered_users:  # Check again in case it was removed
+                        connection_id = registered_users[user_id]['connection_id']
+                        logger.info(f"Removing inactive user {user_id} to stay under user limit")
                         
-                    # Remove user
-                    del registered_users[user_id]
+                        # Clean up pending screenshots
+                        if connection_id in pending_screenshots:
+                            del pending_screenshots[connection_id]
+                            
+                        # Remove user
+                        del registered_users[user_id]
+            
+            # Log active users count 
+            logger.debug(f"Active users: {len(registered_users)}, Connections: {len(pending_screenshots)}")
             
             # Sleep interval
             time.sleep(CONFIG["cleanup_interval_seconds"])
@@ -429,11 +445,15 @@ def register():
         data = request.json
         user_id = data.get('telegram_id')
         
+        logger.info(f"Registration request received for user: {user_id}")
+        
         if not user_id:
+            logger.warning("Registration attempt without telegram_id")
             return jsonify({"status": "error", "message": "Missing telegram_id"})
         
         # Check if maximum users reached
         if len(registered_users) >= CONFIG["max_users"] and user_id not in registered_users:
+            logger.warning(f"Maximum users reached, rejecting new user: {user_id}")
             return jsonify({
                 "status": "error", 
                 "message": "Server at capacity. Please try again later."
@@ -453,6 +473,8 @@ def register():
         pending_screenshots[connection_id] = []
         
         logger.info(f"Registered user {user_id} with connection {connection_id}")
+        logger.debug(f"Current registered users: {list(registered_users.keys())}")
+        logger.debug(f"User data: {registered_users[user_id]}")
         
         return jsonify({
             "status": "success", 
@@ -474,6 +496,9 @@ def ping():
         if not connection_id:
             return jsonify({"status": "error", "message": "Missing connection_id"})
         
+        # Debug log for troubleshooting
+        logger.info(f"Ping received for connection: {connection_id}")
+        
         # Find user by connection ID
         user_found = False
         for user_id, user_data in registered_users.items():
@@ -481,9 +506,12 @@ def ping():
                 user_data['last_ping'] = datetime.now().isoformat()
                 user_data['active'] = True
                 user_found = True
+                logger.info(f"User found for connection {connection_id}: {user_id}")
                 break
         
         if not user_found:
+            logger.warning(f"Invalid connection ID in ping: {connection_id}")
+            logger.debug(f"Current registered users: {list(registered_users.keys())}")
             return jsonify({"status": "error", "message": "Invalid connection_id"})
         
         # Check if there are pending screenshots
@@ -641,6 +669,45 @@ def robots():
     """Serve robots.txt to avoid repeated requests"""
     content = "User-agent: *\nDisallow: /webhook\nDisallow: /register\nDisallow: /ping\nDisallow: /fetch"
     return Response(content, mimetype='text/plain')
+
+# Debug endpoint to check server state - only available if DEBUG is enabled
+@app.route('/debug', methods=['GET'])
+def debug_state():
+    """Debug endpoint to verify server state - only works if API_KEY is set"""
+    # Security check
+    api_key = request.args.get('key')
+    if not api_key or api_key != os.environ.get('API_KEY'):
+        return jsonify({"status": "error", "message": "Unauthorized"}), 401
+    
+    # Safe representation of registered_users (no sensitive data)
+    safe_users = {}
+    for user_id, data in registered_users.items():
+        safe_users[user_id] = {
+            "active": data.get("active", False),
+            "last_ping": data.get("last_ping", "unknown"),
+            "connection_id": data.get("connection_id", "none")
+        }
+    
+    # Connection summary
+    connections = {}
+    for conn_id in pending_screenshots:
+        connections[conn_id] = {
+            "pending_screenshots": len(pending_screenshots[conn_id])
+        }
+    
+    return jsonify({
+        "status": "success",
+        "server_info": {
+            "version": "1.2.0",
+            "memory_usage_mb": f"{get_memory_usage():.2f}" if get_memory_usage() > 0 else "Unknown",
+            "start_time": CONFIG.get("start_time", "unknown"),
+            "registered_users_count": len(registered_users),
+            "pending_screenshots_count": sum(len(queue) for queue in pending_screenshots.values())
+        },
+        "registered_users": safe_users,
+        "connections": connections,
+        "config": {k: v for k, v in CONFIG.items() if k != "api_key"}
+    })
 
 if __name__ == '__main__':
     # Get port from environment variable or use default
