@@ -3,6 +3,7 @@ import os
 import requests
 import json
 import logging
+from logging.handlers import RotatingFileHandler
 from datetime import datetime, timedelta
 import uuid
 import base64
@@ -14,16 +15,16 @@ import gc
 # Configure logging
 logging.basicConfig(
     level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    handlers=[
-        logging.StreamHandler(),
-        # Keep file size small by rotating at 1MB
-        logging.handlers.RotatingFileHandler(
-            'server.log', maxBytes=1024*1024, backupCount=3
-        )
-    ]
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
 )
+# Add file handler separately to avoid issues
 logger = logging.getLogger(__name__)
+try:
+    file_handler = RotatingFileHandler('server.log', maxBytes=1024*1024, backupCount=3)
+    file_handler.setFormatter(logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s'))
+    logger.addHandler(file_handler)
+except Exception as e:
+    print(f"Warning: Could not set up log file: {e}")
 
 app = Flask(__name__)
 
@@ -159,12 +160,12 @@ def home():
     active_users = len(registered_users)
     memory_usage = f"{get_memory_usage():.2f} MB" if get_memory_usage() > 0 else "Unknown"
     
-    return """
+    return f"""
     <html>
         <head>
             <title>DevShare - Screenshot Manager Bot</title>
             <style>
-                body {
+                body {{
                     font-family: Arial, sans-serif;
                     line-height: 1.6;
                     margin: 0;
@@ -172,42 +173,42 @@ def home():
                     color: #333;
                     max-width: 800px;
                     margin: 0 auto;
-                }
-                h1 {
+                }}
+                h1 {{
                     color: #2c3e50;
                     border-bottom: 2px solid #3498db;
                     padding-bottom: 10px;
-                }
-                h2 {
+                }}
+                h2 {{
                     color: #3498db;
                     margin-top: 20px;
-                }
-                .stats {
+                }}
+                .stats {{
                     background-color: #f8f9fa;
                     padding: 15px;
                     border-radius: 5px;
                     margin: 20px 0;
-                }
-                code {
+                }}
+                code {{
                     background-color: #f5f5f5;
                     padding: 2px 5px;
                     border-radius: 3px;
                     font-family: monospace;
-                }
-                ul {
+                }}
+                ul {{
                     margin-left: 20px;
-                }
-                .steps {
+                }}
+                .steps {{
                     margin-left: 0;
                     padding-left: 0;
                     list-style-type: none;
-                }
-                .steps li {
+                }}
+                .steps li {{
                     margin-bottom: 10px;
                     padding-left: 30px;
                     position: relative;
-                }
-                .steps li:before {
+                }}
+                .steps li:before {{
                     content: attr(data-step);
                     position: absolute;
                     left: 0;
@@ -220,7 +221,7 @@ def home():
                     text-align: center;
                     line-height: 20px;
                     font-size: 12px;
-                }
+                }}
             </style>
         </head>
         <body>
@@ -276,7 +277,7 @@ def home():
             or contact the developer at <a href="mailto:ritik135001@gmail.com">ritik135001@gmail.com</a></p>
         </body>
     </html>
-    """.format(active_users=active_users, memory_usage=memory_usage)
+    """
 
 @app.route('/webhook', methods=['POST'])
 def webhook():
