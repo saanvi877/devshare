@@ -11,6 +11,7 @@ from flask_caching import Cache
 import threading
 import time
 import gc
+import random
 
 # Configure logging
 logging.basicConfig(
@@ -40,13 +41,14 @@ cache = Cache(app)
 # Server configuration
 CONFIG = {
     "max_users": 100,  # Maximum number of users to track
-    "max_screenshots_per_user": 10,  # Maximum screenshots per user
-    "cleanup_interval_seconds": 300,  # How often to clean up inactive users
-    "inactive_timeout_minutes": 30,  # When to consider a user inactive
+    "max_screenshots_per_user": 10000,  # Maximum screenshots per user
+    "cleanup_interval_seconds": 600,  # How often to clean up inactive users (increased to 10 minutes)
+    "inactive_timeout_minutes": 1000,  # When to consider a user inactive (increased to 60 minutes)
     "send_confirmations": True,  # Whether to send confirmation messages
-    "max_screenshot_size_bytes": 1024 * 1024 * 5,  # 5MB max screenshot size
+    "max_screenshot_size_bytes": 1024 * 1024 * 10,  # 10MB max screenshot size
     "memory_check_interval": 60,  # Check memory usage every minute
-    "start_time": datetime.now().isoformat()  # Track when server started
+    "start_time": datetime.now().isoformat(),  # Track when server started
+    "connection_retry_count": 3,  # Number of retry attempts for failed connections
 }
 
 # In-memory database of registered users (in production, use a real database)
@@ -103,11 +105,21 @@ def cleanup_and_monitor():
             current_time = datetime.now()
             inactive_timeout = timedelta(minutes=CONFIG["inactive_timeout_minutes"])
             
+            # Create a copy of the keys to prevent modification during iteration
+            user_ids = list(registered_users.keys())
+            
             # Find inactive users
             inactive_users = []
-            for user_id, user_data in registered_users.items():
+            for user_id in user_ids:
+                # Skip if user no longer exists (might have been removed by another process)
+                if user_id not in registered_users:
+                    continue
+                    
                 try:
+                    user_data = registered_users[user_id]
                     last_ping = datetime.fromisoformat(user_data['last_ping'])
+                    
+                    # Only mark as inactive if truly long time without ping
                     if current_time - last_ping > inactive_timeout:
                         inactive_users.append(user_id)
                 except (ValueError, KeyError) as e:
@@ -117,6 +129,10 @@ def cleanup_and_monitor():
                     
             # Remove inactive users
             for user_id in inactive_users:
+                # Check again if user still exists
+                if user_id not in registered_users:
+                    continue
+                    
                 connection_id = registered_users[user_id]['connection_id']
                 logger.info(f"Removing inactive user {user_id}")
                 
@@ -126,40 +142,13 @@ def cleanup_and_monitor():
                     
                 # Remove user
                 del registered_users[user_id]
-                
-            # Limit max users if needed - but never remove active users
-            if len(registered_users) > CONFIG["max_users"]:
-                # Sort users by last ping time, oldest first
-                sorted_users = sorted(
-                    registered_users.items(),
-                    key=lambda x: datetime.fromisoformat(x[1]['last_ping'])
-                )
-                
-                # Find users that haven't been active recently but not yet inactive
-                users_to_remove = []
-                for user_id, user_data in sorted_users:
-                    if not user_data.get('active', False):
-                        users_to_remove.append(user_id)
-                        if len(registered_users) - len(users_to_remove) <= CONFIG["max_users"]:
-                            break
-                
-                # Only remove truly inactive users
-                for user_id in users_to_remove:
-                    if user_id in registered_users:  # Check again in case it was removed
-                        connection_id = registered_users[user_id]['connection_id']
-                        logger.info(f"Removing inactive user {user_id} to stay under user limit")
-                        
-                        # Clean up pending screenshots
-                        if connection_id in pending_screenshots:
-                            del pending_screenshots[connection_id]
-                            
-                        # Remove user
-                        del registered_users[user_id]
             
-            # Log active users count 
-            logger.debug(f"Active users: {len(registered_users)}, Connections: {len(pending_screenshots)}")
+            # Log active users periodically
+            if random.random() < 0.1:  # ~10% chance to log stats
+                logger.debug(f"Active users: {len(registered_users)}, Connections: {len(pending_screenshots)}")
+                logger.debug(f"Registered users: {list(registered_users.keys())}")
             
-            # Sleep interval
+            # Sleep interval (longer to reduce CPU usage)
             time.sleep(CONFIG["cleanup_interval_seconds"])
             
         except Exception as e:
@@ -499,20 +488,52 @@ def ping():
         # Debug log for troubleshooting
         logger.info(f"Ping received for connection: {connection_id}")
         
+        # Thread-safe copy of registered users
+        active_users = dict(registered_users)
+        
         # Find user by connection ID
         user_found = False
-        for user_id, user_data in registered_users.items():
+        for user_id, user_data in active_users.items():
             if user_data.get('connection_id') == connection_id:
-                user_data['last_ping'] = datetime.now().isoformat()
-                user_data['active'] = True
+                # Update user's last ping time
+                registered_users[user_id]['last_ping'] = datetime.now().isoformat()
+                registered_users[user_id]['active'] = True
                 user_found = True
                 logger.info(f"User found for connection {connection_id}: {user_id}")
                 break
         
         if not user_found:
-            logger.warning(f"Invalid connection ID in ping: {connection_id}")
-            logger.debug(f"Current registered users: {list(registered_users.keys())}")
-            return jsonify({"status": "error", "message": "Invalid connection_id"})
+            # Double-check all connections more thoroughly to avoid race conditions
+            connection_found = False
+            for user_id, user_data in list(registered_users.items()):
+                if user_data.get('connection_id') == connection_id:
+                    connection_found = True
+                    # The connection is valid but wasn't found in our first pass
+                    # Update anyway to reconnect
+                    registered_users[user_id]['last_ping'] = datetime.now().isoformat()
+                    registered_users[user_id]['active'] = True
+                    logger.info(f"Connection recovered for {connection_id}: {user_id}")
+                    user_found = True
+                    break
+                    
+            if not connection_found:
+                logger.warning(f"Invalid connection ID in ping: {connection_id}")
+                logger.debug(f"Current registered users: {list(registered_users.keys())}")
+            
+                # Attempt to re-register this connection if we have an ongoing session
+                for user_id, user_data in list(registered_users.items()):
+                    # Look for matching connection ID in pending_screenshots
+                    if connection_id in pending_screenshots:
+                        # Re-link the connection to this user
+                        registered_users[user_id]['connection_id'] = connection_id
+                        registered_users[user_id]['last_ping'] = datetime.now().isoformat()
+                        registered_users[user_id]['active'] = True
+                        logger.info(f"Re-linked connection {connection_id} to user {user_id}")
+                        user_found = True
+                        break
+                    
+                if not user_found:
+                    return jsonify({"status": "error", "message": "Invalid connection_id"})
         
         # Check if there are pending screenshots
         has_pending = connection_id in pending_screenshots and len(pending_screenshots[connection_id]) > 0
